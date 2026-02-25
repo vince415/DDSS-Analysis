@@ -1,0 +1,7 @@
+streamlit
+pandas
+openpyxl
+hashlib
+plotly.graph_objects
+plotly.express
+re
