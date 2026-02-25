@@ -333,7 +333,7 @@ def main():
         )
 
         if not uploaded:
-            st.info("Please upload **MPA_name wkN.xlsx** format files\n\nExample: `fxn wk3.xlsx`")
+            st.info("Please upload **MPA_name wkN.xlsx** format files")
             st.session_state.pop('combined_df', None)
             return
 
@@ -581,4 +581,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
