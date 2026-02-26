@@ -471,9 +471,9 @@ def main():
 
             # Determine hover template based on WOS status
             if is_wos:
-                hover_template = '<b>Wk%{fullData.name}</b><br>Date: %{x|%Y-%m-%d}<br>Value: %{y:.2f}<extra></extra>'
+                hover_template = '<b>%{fullData.name}</b><br>Date: %{x|%Y-%m-%d}<br>Value: %{y:.2f}<extra></extra>'
             else:
-                hover_template = '<b>Wk%{fullData.name}</b><br>Date: %{x|%Y-%m-%d}<br>Value: %{y:,.0f}<extra></extra>'
+                hover_template = '<b>%{fullData.name}</b><br>Date: %{x|%Y-%m-%d}<br>Value: %{y:,.0f}<extra></extra>'
 
             for i, wk in enumerate(weeks):
                 tmp = pp[['Date', wk]].dropna()
@@ -583,3 +583,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
