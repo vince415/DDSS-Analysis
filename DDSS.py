@@ -24,14 +24,30 @@ def normalize(s):
     return str(s).strip().upper() if s is not None else ""
 
 
-def extract_mpa_and_week(filename):
-    """Extract MPA name (uppercase) and week number from filename"""
+def extract_mpa_year_week(filename):
     stem = re.sub(r'\.xlsx?$', '', filename, flags=re.IGNORECASE).strip()
+
+    m = re.search(r'^(.*?)\s*(\d{4})\s*wk\s*(\d+)\s*$', stem, re.IGNORECASE)
+    if m:
+        mpa = m.group(1).strip().upper() if m.group(1).strip() else None
+        year = int(m.group(2))
+        week = int(m.group(3))
+        return mpa, year, week
+
     m = re.search(r'^(.*?)\s*[_\-]?\s*wk\s*(\d+)\s*$', stem, re.IGNORECASE)
     if m:
-        mpa = m.group(1).strip().upper()
-        return (mpa if mpa else None), int(m.group(2))
-    return None, None
+        mpa = m.group(1).strip().upper() if m.group(1).strip() else None
+        week = int(m.group(2))
+        return mpa, None, week
+
+    return None, None, None
+
+
+def create_week_sort_key(year, week):
+    if year is not None:
+        return year * 100 + week
+    else:
+        return week  # Old format, will sort by week only
 
 
 def find_all_ddss_sheets(wb):
@@ -88,9 +104,12 @@ def parse_one_file(file_bytes: bytes, filename: str):
         if not ddss_sheets:
             return None
 
-        mpa_file, week = extract_mpa_and_week(filename)
+        mpa_file, year, week = extract_mpa_year_week(filename)
         if week is None:
             return None
+
+        # Create sort key for proper ordering
+        week_sort_key = create_week_sort_key(year, week)
 
         all_records = []
 
@@ -137,8 +156,17 @@ def parse_one_file(file_bytes: bytes, filename: str):
                 mpa = mpa_file or (normalize(row[cols['mpa']])
                                    if cols['mpa'] < L and row[cols['mpa']] else None)
 
+                # Create week label with year if available
+                if year is not None:
+                    week_label = f"{year}Wk{week}"
+                else:
+                    week_label = f"Wk{week}"
+
                 base = {
                     'Week': week,
+                    'Year': year,
+                    'WeekSortKey': week_sort_key,
+                    'WeekLabel': week_label,
                     'MPA': mpa,
                     'Sheet': sheet_name,
                     'Filename': filename,
@@ -238,8 +266,8 @@ def is_wos_related(text: str) -> bool:
 def build_pivot_tables(desc_agg: pd.DataFrame, metric_label: str = ''):
     """
     Build TWO pivot tables:
-    1. Weekly data table (Wk2, Wk3, Wk4...)
-    2. Delta table (Wk2→Wk3, Wk3→Wk4...)
+    1. Weekly data table (sorted by WeekSortKey)
+    2. Delta table (consecutive week differences)
     """
     oh_df = desc_agg[desc_agg['Column_Type'] == 'On hand']
     fct_df = desc_agg[desc_agg['Column_Type'] == 'Forecast']
@@ -247,47 +275,67 @@ def build_pivot_tables(desc_agg: pd.DataFrame, metric_label: str = ''):
     if fct_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    pt = fct_df.pivot_table(index='Week', columns='Date',
-                            values='Value', aggfunc='sum').T.sort_index()
-    weeks = sorted(pt.columns, reverse=True)  # Reverse order: newest first
+    # Get unique weeks with their sort keys and labels
+    week_info = fct_df[['WeekSortKey', 'WeekLabel']].drop_duplicates()
+    week_info = week_info.sort_values('WeekSortKey', ascending=False)  # Newest first
 
-    # Table 1: Weekly data (Wk5, Wk4, Wk3, Wk2...) - newest at top
+    # Pivot by WeekSortKey for aggregation, but display with WeekLabel
+    pt = fct_df.pivot_table(index='WeekSortKey', columns='Date',
+                            values='Value', aggfunc='sum').T.sort_index()
+
+    # Create mapping from WeekSortKey to WeekLabel
+    key_to_label = dict(zip(week_info['WeekSortKey'], week_info['WeekLabel']))
+
+    # Table 1: Weekly data (newest at top)
     weekly_rows = []
-    for wk in weeks:
-        r = {'Metric': f'Wk{wk}'}
-        oh = oh_df[oh_df['Week'] == wk]
-        oh_val = oh['Value'].sum() if not oh.empty else None
+    for sort_key in week_info['WeekSortKey']:
+        label = key_to_label[sort_key]
+        r = {'Metric': label}
+
+        # Get On hand for this week
+        oh_rows = oh_df[oh_df['WeekSortKey'] == sort_key]
+        oh_val = oh_rows['Value'].sum() if not oh_rows.empty else None
         r['On hand'] = oh_val
 
+        # Get forecast values for each date
         for dt in pt.index:
-            v = pt.loc[dt, wk]
-            date_str = dt.strftime('%Y-%m-%d')
-            r[date_str] = v if pd.notna(v) else None
+            if sort_key in pt.columns:
+                v = pt.loc[dt, sort_key]
+                date_str = dt.strftime('%Y-%m-%d')
+                r[date_str] = v if pd.notna(v) else None
         weekly_rows.append(r)
 
     weekly_table = pd.DataFrame(weekly_rows)
 
-    # Table 2: Delta/difference table (Wk5→Wk4, Wk4→Wk3...) - newest at top
+    # Table 2: Delta table (consecutive week differences, newest first)
     delta_rows = []
-    for i in range(len(weeks) - 1):
-        # Since weeks is reversed, consecutive pairs are nw→cw (newer→current)
-        nw, cw = weeks[i], weeks[i + 1]  # Swapped order for reverse
-        r = {'Metric': f'Wk{nw}→Wk{cw}'}
-        c_oh = oh_df[oh_df['Week'] == cw]
-        n_oh = oh_df[oh_df['Week'] == nw]
+    sort_keys = list(week_info['WeekSortKey'])
 
-        if not c_oh.empty and not n_oh.empty:
-            r['On hand'] = n_oh['Value'].sum() - c_oh['Value'].sum()
+    for i in range(len(sort_keys) - 1):
+        newer_key = sort_keys[i]
+        older_key = sort_keys[i + 1]
+        newer_label = key_to_label[newer_key]
+        older_label = key_to_label[older_key]
+
+        r = {'Metric': f'{newer_label}→{older_label}'}
+
+        # Delta for On hand
+        newer_oh = oh_df[oh_df['WeekSortKey'] == newer_key]
+        older_oh = oh_df[oh_df['WeekSortKey'] == older_key]
+
+        if not newer_oh.empty and not older_oh.empty:
+            r['On hand'] = newer_oh['Value'].sum() - older_oh['Value'].sum()
         else:
             r['On hand'] = None
 
+        # Delta for each date
         for dt in pt.index:
-            cv = pt.loc[dt, cw] if cw in pt.columns else None
-            nv = pt.loc[dt, nw] if nw in pt.columns else None
+            newer_val = pt.loc[dt, newer_key] if newer_key in pt.columns else None
+            older_val = pt.loc[dt, older_key] if older_key in pt.columns else None
             date_str = dt.strftime('%Y-%m-%d')
 
-            if pd.notna(cv) and pd.notna(nv):
-                r[date_str] = nv - cv
+            if pd.notna(newer_val) and pd.notna(older_val):
+                r[date_str] = newer_val - older_val
             else:
                 r[date_str] = None
         delta_rows.append(r)
@@ -326,14 +374,14 @@ def main():
     with st.sidebar:
         st.markdown("## 📁 Upload Files")
         uploaded = st.file_uploader(
-            "Select Excel files (batch supported, naming: MPA_name wkN.xlsx)",
+            "Select Excel files (batch supported, naming: MPA YYYYwk00.xlsx)",
             type=['xlsx'],
             accept_multiple_files=True,
             label_visibility="collapsed",
         )
 
         if not uploaded:
-            st.info("Please upload **MPA_name wkN.xlsx** format files")
+            st.info("Please upload files\n\nFormat: `MPA YYYYwk00.xlsx`")
             st.session_state.pop('combined_df', None)
             return
 
@@ -412,7 +460,7 @@ def main():
 
     # ────────── Main Area ───────────────────────────────────────
     st.title("📊 DDSS Forecast Analysis")
-    st.caption("File naming format: `MPA_name wkN.xlsx`, e.g., `fxn wk3.xlsx` / `FOXCONN WK10.xlsx`")
+    st.caption("File naming: `MPA YYYYwk00.xlsx` (year+week format)")
 
     if 'combined_df' not in st.session_state or st.session_state['combined_df'] is None:
         st.info("👈 Please upload files in the left sidebar")
@@ -423,12 +471,14 @@ def main():
         st.warning("No matching data, please adjust filters")
         return
 
-    # Overview Metrics
-    wk_min = combined['Week'].min()
-    wk_max = combined['Week'].max()
+    # Overview Metrics - show week range using WeekLabel
+    week_labels = sorted(combined['WeekLabel'].dropna().unique())
+    wk_min_label = week_labels[0] if week_labels else "N/A"
+    wk_max_label = week_labels[-1] if week_labels else "N/A"
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Files", len(uploaded))
-    c2.metric("Week Range", f"Wk{wk_min} – Wk{wk_max}")
+    c2.metric("Week Range", f"{wk_min_label} – {wk_max_label}")
     c3.metric("Selected MPA", f"{len(sel_mpa)} MPA(s)")
     c4.metric("Selected Parts", f"{len(sel_part)} Part(s)")
 
@@ -456,16 +506,16 @@ def main():
         st.caption(f"MPA: **{mpa_label}**　　Sheet: **{sheet_label}**　　Part: {part_label}")
 
         sub = filtered[filtered['Data_Description'] == desc]
-        agg = sub.groupby(['Week', 'Date', 'Column_Type'], as_index=False)['Value'].sum()
+        agg = sub.groupby(['WeekSortKey', 'WeekLabel', 'Date', 'Column_Type'], as_index=False)['Value'].sum()
 
         # Line Chart
         fct = agg[agg['Column_Type'] == 'Forecast']
         if not fct.empty:
-            pp = (fct.pivot_table(index='Date', columns='Week',
+            pp = (fct.pivot_table(index='Date', columns='WeekLabel',
                                   values='Value', aggfunc='sum')
                   .reset_index().sort_values('Date'))
 
-            weeks = sorted(c for c in pp.columns if c != 'Date')
+            week_labels_chart = [c for c in pp.columns if c != 'Date']
             colors = px.colors.qualitative.Set2
             fig = go.Figure()
 
@@ -475,29 +525,24 @@ def main():
             else:
                 hover_template = '<b>%{fullData.name}</b><br>Date: %{x|%Y-%m-%d}<br>Value: %{y:,.0f}<extra></extra>'
 
-            for i, wk in enumerate(weeks):
-                tmp = pp[['Date', wk]].dropna()
+            for i, wk_label in enumerate(week_labels_chart):
+                tmp = pp[['Date', wk_label]].dropna()
                 fig.add_trace(go.Scatter(
-                    x=tmp['Date'], y=tmp[wk],
+                    x=tmp['Date'], y=tmp[wk_label],
                     mode='lines+markers',
-                    name=f'Wk{wk}',
+                    name=wk_label,
                     line=dict(width=2.5, color=colors[i % len(colors)]),
                     marker=dict(size=6),
                     hovertemplate=hover_template,
                 ))
 
-            # FIX 1: X-axis shows only actual data dates (Mondays in the data)
+            # Reduce date label density
             actual_dates = sorted(pp['Date'].unique())
-
-            # Reduce date label density: show every 2nd or 3rd date
             if len(actual_dates) > 10:
-                # For many dates, show every 3rd date
                 display_dates = actual_dates[::3]
             elif len(actual_dates) > 5:
-                # For moderate number of dates, show every 2nd date
                 display_dates = actual_dates[::2]
             else:
-                # For few dates, show all
                 display_dates = actual_dates
 
             fig.update_layout(
@@ -508,8 +553,8 @@ def main():
                             xanchor="right", yanchor="bottom"),
                 xaxis=dict(
                     tickformat='%Y-%m-%d',
-                    tickmode='array',  # Use array mode to specify exact ticks
-                    tickvals=display_dates,  # Show reduced set of dates
+                    tickmode='array',
+                    tickvals=display_dates,
                     tickangle=-45,
                     tickfont=dict(size=10),
                 ),
@@ -517,10 +562,10 @@ def main():
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        # FIX 2: Split into two separate tables
+        # Split tables
         weekly_table, delta_table = build_pivot_tables(agg, metric_label=desc)
 
-        # Table 1: Weekly data (Wk2, Wk3, Wk4...)
+        # Table 1: Weekly data
         with st.expander(f"📋 {desc}", expanded=True):
             if weekly_table.empty:
                 st.info("No data")
@@ -533,7 +578,7 @@ def main():
                 )
                 download_tables[desc] = weekly_table
 
-        # Table 2: Delta table (Wk2→Wk3, Wk3→Wk4...)
+        # Table 2: Delta table
         with st.expander(f"📋 {desc} Delta", expanded=True):
             if delta_table.empty:
                 st.info("No delta data")
@@ -581,6 +626,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
-
